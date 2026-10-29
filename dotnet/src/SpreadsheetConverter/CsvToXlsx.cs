@@ -15,6 +15,12 @@ internal sealed record CsvToXlsxOptions
 
     /// <summary>Rows per worksheet, header included. Further rows continue on a new sheet with the header repeated.</summary>
     public int SheetRows { get; init; } = ExcelLimits.MaxRows;
+
+    /// <summary>Rejects invalid UTF-8 and schema columns missing from the header, instead of passing the data through.</summary>
+    public bool Strict { get; init; }
+
+    /// <summary>Field separator, or null to let Sep detect it from the header row (comma, semicolon, tab or pipe).</summary>
+    public char? Delimiter { get; init; }
 }
 
 internal sealed record CsvToXlsxResult(int Rows, int Sheets, int ClippedCells)
@@ -48,14 +54,31 @@ internal static class CsvToXlsx
         // The header is read as an ordinary row, because Sep's own header handling rejects repeated column names,
         // which exports of joined queries and blank header cells commonly have. Column counts are checked in
         // FillCells, so that blank lines can be skipped and the error names the header's column count.
-        var readerOptions = Sep.New(',').Reader(o => o with { Unescape = true, HasHeader = false, DisableColCountCheck = true });
+        // Without --delimiter, Sep detects the separator from the first line (comma, semicolon, tab or pipe, falling
+        // back to semicolon), so the semicolon "CSV" that Excel and Numbers save in many European locales converts as
+        // is. The detection counts characters without regard to quotes.
+        Func<SepReaderOptions, SepReaderOptions> configure = o => o with { Unescape = true, HasHeader = false, DisableColCountCheck = true };
+        var readerOptions = options.Delimiter is { } delimiter ? Sep.New(delimiter).Reader(configure) : Sep.Reader(configure);
         using var reader = input is null ? readerOptions.FromFile(inputPath) : readerOptions.From(input);
+        return await ConvertAsync(reader, outputPath, options, schema);
+    }
+
+    private static async Task<CsvToXlsxResult> ConvertAsync(SepReader reader, string outputPath, CsvToXlsxOptions options, Dictionary<string, Column> schema)
+    {
         if (!reader.MoveNext())
         {
             throw new InvalidDataException("input is empty, expected a header row");
         }
+        if (reader.Current.Span.IsEmpty && options.Delimiter is null)
+        {
+            // Sep detects from the first line; from a blank one it falls back to a semicolon and would quietly read a
+            // comma-separated file as one column. With --delimiter, a blank first line is an empty one-column header.
+            throw new InvalidDataException(
+                "line 1 is blank, so the delimiter cannot be detected; remove the blank line or pass --delimiter");
+        }
 
-        CheckQuotesClosed(reader.Current);
+        // The header is line 1; Sep reports a wrong line number for the first row.
+        CheckRow(reader.Current, options.Strict, line: 1);
         var columnNames = Enumerable.Range(0, reader.Current.ColCount).Select(i => reader.Current[i].ToString()).ToArray();
         var width = columnNames.Length;
         if (width > ExcelLimits.MaxColumns)
@@ -63,20 +86,41 @@ internal static class CsvToXlsx
             throw new InvalidDataException($"header has {width} columns, Excel allows at most {ExcelLimits.MaxColumns}");
         }
         var columns = ColumnsFor(columnNames, schema);
+        if (options.Strict)
+        {
+            var missing = schema.Keys.Where(name => !columnNames.Contains(name, StringComparer.Ordinal)).ToArray();
+            if (missing.Length > 0)
+            {
+                throw new InvalidDataException($"schema: {string.Join(", ", missing.Select(name => $"'{name}'"))} not in the header");
+            }
+        }
 
         await using var output = new AtomicFile(outputPath);
-        await using var spreadsheet = await Spreadsheet.CreateNewAsync(output.Stream);
+        // Without xml:space="preserve", readers (Excel included) drop leading and trailing spaces from text.
+        await using var spreadsheet = await Spreadsheet.CreateNewAsync(output.Stream, new SpreadCheetahOptions { PreserveStringWhitespace = true });
         var headerStyle = spreadsheet.AddStyle(new Style { Font = { Bold = true } });
+        var wrappedHeaderStyle = spreadsheet.AddStyle(new Style { Font = { Bold = true }, Alignment = { WrapText = true } });
         var types = columns.Select(column => column.Type).ToArray();
         var styles = ColumnStyles(spreadsheet, columns);
 
         var clippedCells = columnNames.Count(name => name.Length > ExcelLimits.MaxCellChars);
-        var header = columnNames.Select(name => new Cell(ExcelLimits.Clip(name), headerStyle)).ToArray();
+        var header = columnNames
+            .Select(name => new Cell(ExcelLimits.Clip(name), HasLineBreak(name) ? wrappedHeaderStyle : headerStyle))
+            .ToArray();
         var worksheetOptions = new WorksheetOptions
         {
             FrozenRows = 1,
             AutoFilter = new AutoFilterOptions($"A1:{ExcelLimits.ColumnName(width)}1"),
         };
+        // Excel shows ##### for a date or formatted number that does not fit, and its default width (about 8.4
+        // characters) is too narrow for a date-time or an Accounting amount.
+        for (var i = 0; i < width; i++)
+        {
+            if (ColumnWidth(columns[i]) is { } columnWidth)
+            {
+                worksheetOptions.Column(i + 1).Width = columnWidth;
+            }
+        }
 
         var sheets = 0;
         var sheetRow = 0;
@@ -107,7 +151,7 @@ internal static class CsvToXlsx
                 await StartSheetAsync();
             }
 
-            clippedCells += FillCells(reader.Current, cells, types, styles);
+            clippedCells += FillCells(reader.Current, cells, types, styles, options.Strict);
             await spreadsheet.AddRowAsync(cells);
             sheetRow++;
             rows++;
@@ -119,9 +163,9 @@ internal static class CsvToXlsx
     }
 
     /// <summary>Converts one CSV row into <paramref name="cells"/> and returns how many values were clipped.</summary>
-    private static int FillCells(SepReader.Row row, Cell[] cells, ColumnType[] types, StyleId?[] styles)
+    private static int FillCells(SepReader.Row row, Cell[] cells, ColumnType[] types, ColumnStyle[] styles, bool strict)
     {
-        CheckQuotesClosed(row);
+        CheckRow(row, strict, row.LineNumberFrom);
         if (row.ColCount != cells.Length)
         {
             throw new InvalidDataException(
@@ -139,12 +183,19 @@ internal static class CsvToXlsx
     /// <summary>
     /// Sep accepts a quoted field left open at the end of the input; a complete RFC 4180 row always has an even
     /// number of quotes, so this catches input that was cut off mid-row (for example a producer that crashed).
+    ///
+    /// Invalid UTF-8 is decoded as U+FFFD, so in strict mode a row containing it is rejected. Checking the decoded
+    /// row, rather than failing in the decoder, which reads far ahead of the rows, names the exact line.
     /// </summary>
-    private static void CheckQuotesClosed(SepReader.Row row)
+    private static void CheckRow(SepReader.Row row, bool strict, int line)
     {
         if (row.Span.Count('"') % 2 != 0)
         {
-            throw new InvalidDataException($"line {row.LineNumberFrom}: quoted field is never closed");
+            throw new InvalidDataException($"line {line}: quoted field is never closed");
+        }
+        if (strict && row.Span.Contains('\uFFFD'))
+        {
+            throw new InvalidDataException($"line {line}: not valid UTF-8 (or contains the replacement character \uFFFD)");
         }
     }
 
@@ -170,16 +221,66 @@ internal static class CsvToXlsx
     /// Columns sharing a format share a style. A value that falls back to text keeps its column's style, which only
     /// affects how numbers display, so the text is shown unchanged.
     /// </summary>
-    private static StyleId?[] ColumnStyles(Spreadsheet spreadsheet, Column[] columns)
+    private static ColumnStyle[] ColumnStyles(Spreadsheet spreadsheet, Column[] columns)
     {
-        var styles = new Dictionary<string, StyleId>(StringComparer.Ordinal);
-        return columns.Select(column => (column.Format ?? DefaultFormat(column.Type)) switch
+        var styles = new Dictionary<string, ColumnStyle>(StringComparer.Ordinal);
+        return columns.Select(column =>
         {
-            null => (StyleId?)null,
-            var format => styles.TryGetValue(format, out var style)
-                ? style
-                : styles[format] = spreadsheet.AddStyle(new Style { Format = NumberFormat.Custom(format) }),
+            var format = column.Format ?? DefaultFormat(column.Type);
+            if (!styles.TryGetValue(format ?? "", out var style))
+            {
+                var numberFormat = format is null ? (NumberFormat?)null : NumberFormat.Custom(format);
+                style = styles[format ?? ""] = new ColumnStyle(
+                    numberFormat is null ? null : spreadsheet.AddStyle(new Style { Format = numberFormat }),
+                    spreadsheet.AddStyle(new Style { Format = numberFormat, Alignment = { WrapText = true } }));
+            }
+            return style;
         }).ToArray();
+    }
+
+    /// <summary>
+    /// The schema's width, else one that fits the column's format: the default date formats (a custom date format is
+    /// assumed to show about as many characters as its code), and formatted amounts up to "9.999.999,99 kr." with
+    /// Accounting padding.
+    /// Rows are streamed, so widths cannot be measured from the data.
+    /// </summary>
+    private static double? ColumnWidth(Column column) => column.Width ?? column.Type switch
+    {
+        ColumnType.Date => Math.Max(column.Format is null ? 10 : DisplayLength(column.Format), 10) + 2,
+        ColumnType.DateTime => Math.Max(column.Format is null ? 19 : DisplayLength(column.Format), 10) + 2,
+        ColumnType.Number when column.Format is not null && XlsxToCsv.FormatShowsDate(column.Format) =>
+            Math.Max(DisplayLength(column.Format) + 2, FormattedNumberWidth),
+        ColumnType.Number when column.Format is not null => FormattedNumberWidth,
+        _ => null,
+    };
+
+    private const double FormattedNumberWidth = 18;
+
+    /// <summary>
+    /// About how many characters a date format shows: its code length, except that month and weekday names
+    /// (mmmm, dddd: up to 9 characters, as in "September" and "Wednesday") and one-letter d, m, h and s (up to 2
+    /// digits) are longer than their codes.
+    /// </summary>
+    internal static int DisplayLength(string format)
+    {
+        var length = 0;
+        for (var i = 0; i < format.Length;)
+        {
+            var c = char.ToLowerInvariant(format[i]);
+            var run = 1;
+            while (i + run < format.Length && char.ToLowerInvariant(format[i + run]) == c)
+            {
+                run++;
+            }
+            length += c switch
+            {
+                'm' or 'd' when run >= 4 => 9,
+                'd' or 'm' or 'h' or 's' when run == 1 => 2,
+                _ => run,
+            };
+            i += run;
+        }
+        return length;
     }
 
     private static string? DefaultFormat(ColumnType type) => type switch
@@ -189,23 +290,31 @@ internal static class CsvToXlsx
         _ => null,
     };
 
-    private static Cell ToCell(string value, ColumnType type, StyleId? style, ref int clippedCells)
+    /// <param name="Wrapped">For text with a line break, which Excel only shows with wrap text on, as after Alt+Enter.</param>
+    private sealed record ColumnStyle(StyleId? Plain, StyleId Wrapped);
+
+    /// <summary>A lone \r counts too: XML readers, Excel included, turn it into a line break.</summary>
+    private static bool HasLineBreak(string value) => value.AsSpan().IndexOfAny('\n', '\r') >= 0;
+
+    private static Cell ToCell(string value, ColumnType type, ColumnStyle columnStyle, ref int clippedCells)
     {
         if (value.Length == 0)
         {
             return default;
         }
 
+        // Surrounding spaces are ignored when parsing a typed value; a value that falls back to text keeps them.
+        var trimmed = type == ColumnType.Text ? value : value.Trim();
         switch (type)
         {
-            case ColumnType.Number when double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) && double.IsFinite(number):
-                return new Cell(number, style);
-            case ColumnType.Bool when TryParseBool(value, out var boolean):
-                return new Cell(boolean, style);
-            case ColumnType.Date when TryParseExcelDate(value, DateFormats, out var date):
-                return new Cell(date, style);
-            case ColumnType.DateTime when TryParseExcelDate(value, DateTimeFormats, out var dateTime):
-                return new Cell(dateTime, style);
+            case ColumnType.Number when double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) && double.IsFinite(number):
+                return new Cell(number, columnStyle.Plain);
+            case ColumnType.Bool when TryParseBool(trimmed, out var boolean):
+                return new Cell(boolean, columnStyle.Plain);
+            case ColumnType.Date when TryParseExcelDate(trimmed, DateFormats, out var date):
+                return new Cell(date, columnStyle.Plain);
+            case ColumnType.DateTime when TryParseExcelDate(trimmed, DateTimeFormats, out var dateTime):
+                return new Cell(dateTime, columnStyle.Plain);
         }
 
         if (value.Length > ExcelLimits.MaxCellChars)
@@ -213,7 +322,7 @@ internal static class CsvToXlsx
             value = ExcelLimits.Clip(value);
             clippedCells++;
         }
-        return new Cell(value, style);
+        return new Cell(value, HasLineBreak(value) ? columnStyle.Wrapped : columnStyle.Plain);
     }
 
     /// <summary>

@@ -31,6 +31,9 @@ internal static class XlsxToCsv
     /// <param name="output">Stream to write to, or null to write <paramref name="outputPath"/>.</param>
     public static async Task<XlsxToCsvResult> ConvertAsync(string inputPath, Stream? output, string outputPath, XlsxToCsvOptions options)
     {
+        // xls stores text in Windows code pages, which .NET only provides through this provider (Sylvan needs 1252).
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+
         await using var input = File.OpenRead(inputPath);
         using var reader = ExcelDataReader.Create(input, DetectWorkbookType(input), new ExcelDataReaderOptions
         {
@@ -131,15 +134,32 @@ internal static class XlsxToCsv
         }
         if (length >= 4 && signature[..4].SequenceEqual(ZipSignature))
         {
-            ExcelWorkbookType type;
-            using (var archive = new ZipArchive(input, ZipArchiveMode.Read, leaveOpen: true))
-            {
-                type = archive.GetEntry("xl/workbook.bin") is not null ? ExcelWorkbookType.ExcelBinary : ExcelWorkbookType.ExcelXml;
-            }
+            var type = ZipWorkbookType(input);
             input.Position = 0;
             return type;
         }
         throw new InvalidDataException("input is not an xlsx, xlsb or xls workbook");
+    }
+
+    private static ExcelWorkbookType ZipWorkbookType(Stream input)
+    {
+        try
+        {
+            using var archive = new ZipArchive(input, ZipArchiveMode.Read, leaveOpen: true);
+            if (archive.GetEntry("xl/workbook.bin") is not null)
+            {
+                return ExcelWorkbookType.ExcelBinary;
+            }
+            if (archive.GetEntry("xl/workbook.xml") is not null)
+            {
+                return ExcelWorkbookType.ExcelXml;
+            }
+        }
+        catch (InvalidDataException)
+        {
+            // A damaged archive: reported below like any other zip that is not a workbook.
+        }
+        throw new InvalidDataException("input is a zip archive but not an xlsx or xlsb workbook");
     }
 
     private static ReadOnlySpan<byte> OleSignature => [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -173,13 +193,15 @@ internal static class XlsxToCsv
             case ExcelDataType.String:
                 return reader.GetString(ordinal);
             case ExcelDataType.DateTime:
-                return FormatDateTime(reader.GetDateTime(ordinal));
+                return FormatDateTime(reader.GetDateTime(ordinal), FormatShowsTime(reader.GetFormat(ordinal)?.Format));
             case ExcelDataType.Numeric when IsElapsedTimeFormat(reader.GetFormat(ordinal)?.Format):
                 return FormatDuration(reader.GetDouble(ordinal));
             case ExcelDataType.Numeric:
                 return reader.GetFormat(ordinal)?.Kind switch
                 {
                     FormatKind.Date => FormatDate(reader, ordinal),
+                    // Excel shows ##### for a negative time, so it is written as the number rather than wrapped.
+                    FormatKind.Time when reader.GetDouble(ordinal) < 0 => FormatNumber(reader.GetDouble(ordinal)),
                     FormatKind.Time => FormatTime(reader.GetDouble(ordinal)),
                     _ => FormatNumber(reader.GetDouble(ordinal)),
                 };
@@ -188,23 +210,76 @@ internal static class XlsxToCsv
         }
     }
 
-    /// <summary>A date-formatted number Excel cannot show as a date (such as a negative serial) is written as the number.</summary>
+    /// <summary>
+    /// A date-formatted number that is not a real date is written as the number: a negative serial, one in Excel's
+    /// fictional early 1900 (such as 60, the 29th of February 1900) or one after 9999-12-31, which Excel shows as
+    /// #####. A value below 1 in a format that shows a time is a time of day without a date, written as H:i:s.
+    /// </summary>
     private static string FormatDate(ExcelDataReader reader, int ordinal)
     {
+        var showsTime = FormatShowsTime(reader.GetFormat(ordinal)?.Format);
+        var value = reader.GetDouble(ordinal);
+        if (showsTime && value is >= 0 and < 1)
+        {
+            return FormatTime(value);
+        }
+
         try
         {
-            return FormatDateTime(reader.GetDateTime(ordinal));
+            return FormatDateTime(reader.GetDateTime(ordinal), showsTime);
         }
-        catch (InvalidCastException)
+        catch (Exception exception) when (exception is InvalidCastException or ArgumentOutOfRangeException)
         {
-            return FormatNumber(reader.GetDouble(ordinal));
+            return FormatNumber(value);
         }
     }
 
-    private static string FormatDateTime(DateTime value) =>
-        value.TimeOfDay == TimeSpan.Zero
-            ? value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
-            : value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
+    /// <summary>
+    /// A date-time when the format shows a time, so a date-time column stays uniform even at midnight. A date format
+    /// only drops the time when it is midnight, so a time the format hides is not lost.
+    /// </summary>
+    private static string FormatDateTime(DateTime value, bool formatShowsTime) =>
+        formatShowsTime || value.TimeOfDay != TimeSpan.Zero
+            ? value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+            : value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Whether a format code shows hours or seconds, ignoring quoted text, escaped characters and [sections]. Sylvan
+    /// only classifies a format as a date or a time, so a date-time and an elapsed duration are told apart here.
+    /// </summary>
+    internal static bool FormatShowsTime(string? format) => FormatHasCode(format, "hHsS");
+
+    /// <summary>Whether a format code shows a day or year, ignoring quoted text, escaped characters and [sections].</summary>
+    internal static bool FormatShowsDate(string? format) => FormatHasCode(format, "dDyY");
+
+    private static bool FormatHasCode(string? format, string codes)
+    {
+        if (format is null)
+        {
+            return false;
+        }
+
+        var inQuotes = false;
+        for (var i = 0; i < format.Length; i++)
+        {
+            switch (format[i])
+            {
+                case '"':
+                    inQuotes = !inQuotes;
+                    break;
+                case '\\' or '_' or '*' when !inQuotes:
+                    i++;
+                    break;
+                case '[' when !inQuotes:
+                    var end = format.IndexOf(']', i);
+                    i = end < 0 ? format.Length : end;
+                    break;
+                case var c when !inQuotes && codes.Contains(c):
+                    return true;
+            }
+        }
+        return false;
+    }
 
     /// <summary>Rounds to whole seconds, capped at 23:59:59 so a value just below midnight does not wrap to 00:00:00.</summary>
     internal static string FormatTime(double value) =>

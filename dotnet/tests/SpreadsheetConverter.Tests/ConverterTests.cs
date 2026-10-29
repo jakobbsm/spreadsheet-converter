@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Text;
+using System.Xml.Linq;
 using SpreadCheetah;
 using Sylvan.Data.Excel;
 
@@ -149,6 +150,9 @@ public sealed class ConverterTests : IDisposable
     [InlineData("""{"a": {"type": "number", "format": "h]:mm"}}""", "unmatched ']'")]
     [InlineData("""{"a": {"type": "number", "fromat": "0"}}""", "unknown key 'fromat'")]
     [InlineData("""{"a": 1}""", "must be a type name or an object")]
+    [InlineData("""{"a": {"width": 0}}""", "width must be above 0")]
+    [InlineData("""{"a": {"width": 300}}""", "at most 255")]
+    [InlineData("""{"a": {"width": "20"}}""", "\"width\" must be a number")]
     public async Task ToXlsx_RejectsInvalidSchemas(string json, string error)
     {
         var input = WriteFile("in.csv", "a\n1\n");
@@ -222,6 +226,273 @@ public sealed class ConverterTests : IDisposable
         Assert.True(exitCode == Cli.Success, stderr);
         using var reader = ExcelDataReader.Create(output, new ExcelDataReaderOptions { Schema = ExcelSchema.Dynamic });
         Assert.Equal([name, new string('x', 26) + " (2)"], reader.WorksheetNames);
+    }
+
+    [Fact]
+    public async Task ToXlsx_Strict_RejectsSchemaColumnsMissingFromTheHeader()
+    {
+        var input = WriteFile("in.csv", "id,revenue\n1,2\n");
+        var schema = WriteFile("schema.json", """{"id": "number", "revenu": "number", "founded": "date"}""");
+
+        var (exitCode, _, _) = await RunAsync("to-xlsx", "--schema-file", schema, input, PathFor("lenient.xlsx"));
+        Assert.Equal(Cli.Success, exitCode);
+
+        (exitCode, _, var stderr) = await RunAsync("to-xlsx", "--strict", "--schema-file", schema, input, PathFor("strict.xlsx"));
+        Assert.Equal(Cli.Failure, exitCode);
+        Assert.Contains("schema: 'revenu', 'founded' not in the header", stderr);
+    }
+
+    [Fact]
+    public async Task ToXlsx_Strict_RejectsInvalidUtf8()
+    {
+        var input = PathFor("in.csv");
+        File.WriteAllBytes(input, [.. "\uFEFFid,name\n1,ok\n2,"u8, 0xC6, .. "ble\n"u8]);
+
+        var (exitCode, stdout, _) = await RunAsync("to-xlsx", input, PathFor("lenient.xlsx"));
+        Assert.Equal(Cli.Success, exitCode);
+        Assert.Contains("\"rows\":2", stdout);
+        Assert.Equal("id,name\n1,ok\n2,\uFFFDble\n", (await RunAsync("to-csv", PathFor("lenient.xlsx"), "-")).Stdout);
+
+        (exitCode, _, var stderr) = await RunAsync("to-xlsx", "--strict", input, PathFor("strict.xlsx"));
+        Assert.Equal(Cli.Failure, exitCode);
+        Assert.Contains("line 3: not valid UTF-8", stderr);
+        Assert.False(File.Exists(PathFor("strict.xlsx")));
+    }
+
+    [Fact]
+    public async Task ToXlsx_Strict_NamesTheExactLineInALargeInput()
+    {
+        var input = PathFor("in.csv");
+        var rows = string.Concat(Enumerable.Range(1, 20_000).Select(i => $"{i},ok\n"));
+        File.WriteAllBytes(input, [.. Encoding.UTF8.GetBytes($"id,name\n{rows}"), 0xFF, .. "\n"u8]);
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", "--strict", input, PathFor("out.xlsx"));
+
+        Assert.Equal(Cli.Failure, exitCode);
+        Assert.Contains("line 20002: not valid UTF-8", stderr);
+    }
+
+    [Fact]
+    public async Task ToXlsx_Strict_AcceptsValidInputWithABom()
+    {
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync(["to-xlsx", "--strict", "-", output], stdin: "\uFEFFid,name\n1,Æble\n");
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("id,name\n1,Æble\n", (await RunAsync("to-csv", output, "-")).Stdout);
+    }
+
+    [Fact]
+    public async Task ToXlsx_WidensDateColumnsSoExcelDoesNotShowHashes()
+    {
+        var input = WriteFile("in.csv", "id,founded,modified\n1,2024-01-31,2024-01-31 13:45:00\n");
+        var schema = WriteFile("schema.json", """{"founded": "date", "modified": "datetime"}""");
+        var output = PathFor("out.xlsx");
+
+        await RunAsync("to-xlsx", "--schema-file", schema, input, output);
+
+        var xml = ReadWorksheetXml(output, 1);
+        Assert.Contains("<col min=\"2\" max=\"2\" width=\"12\"", xml);
+        Assert.Contains("<col min=\"3\" max=\"3\" width=\"21\"", xml);
+    }
+
+    [Fact]
+    public async Task ToXlsx_WidensFormattedNumberColumns_AndAppliesTheSchemasWidths()
+    {
+        var input = WriteFile("in.csv", "id,revenue,ratio,note,founded\n1,12345.5,0.5,x,2024-01-31\n");
+        var schema = WriteFile("schema.json", """
+            {
+              "id": "number",
+              "revenue": {"type": "number", "format": "#,##0.00 \"kr.\""},
+              "ratio": {"type": "number", "format": "0%", "width": 7},
+              "note": {"width": 40.5},
+              "founded": {"type": "date", "width": 15}
+            }
+            """);
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", "--schema-file", schema, input, output);
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        var xml = ReadWorksheetXml(output, 1);
+        Assert.DoesNotContain("<col min=\"1\"", xml);
+        Assert.Contains("<col min=\"2\" max=\"2\" width=\"18\"", xml);
+        Assert.Contains("<col min=\"3\" max=\"3\" width=\"7\"", xml);
+        Assert.Contains("<col min=\"4\" max=\"4\" width=\"40.5\"", xml);
+        Assert.Contains("<col min=\"5\" max=\"5\" width=\"15\"", xml);
+    }
+
+    [Fact]
+    public async Task ToXlsx_SizesNumberColumnsWithADateFormatLikeDates()
+    {
+        var input = WriteFile("in.csv", "serial,amount\n45560,1234.5\n");
+        var schema = WriteFile("schema.json", """{"serial": {"type": "number", "format": "dddd d. mmmm yyyy"}, "amount": {"type": "number", "format": "_-* #,##0.00 \"kr.\"_-"}}""");
+        var output = PathFor("out.xlsx");
+
+        await RunAsync("to-xlsx", "--schema-file", schema, input, output);
+
+        var xml = ReadWorksheetXml(output, 1);
+        Assert.Contains("<col min=\"1\" max=\"1\" width=\"30\"", xml);
+        Assert.Contains("<col min=\"2\" max=\"2\" width=\"18\"", xml);
+    }
+
+    [Theory]
+    [InlineData("n\u00E6me\n1\n", true, "line 1: not valid UTF-8")]
+    [InlineData("\n\nn\u00E6me\n1\n", true, "line 3: not valid UTF-8")]
+    [InlineData("a,\"b\n1,2\n", false, "line 1: quoted field is never closed")]
+    public async Task ToXlsx_NamesTheHeadersOwnLine(string csv, bool latin1, string error)
+    {
+        var input = PathFor("in.csv");
+        File.WriteAllBytes(input, latin1 ? Encoding.Latin1.GetBytes(csv) : Encoding.UTF8.GetBytes(csv));
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", "--strict", "--delimiter", ",", input, PathFor("out.xlsx"));
+
+        Assert.Equal(Cli.Failure, exitCode);
+        Assert.Contains(error, stderr);
+    }
+
+    [Fact]
+    public async Task ToXlsx_ABlankFirstLineIsAnEmptyHeader_WithAGivenDelimiter()
+    {
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", "--delimiter", ",", WriteFile("one.csv", "\nx\ny\n"), output);
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("\nx\ny\n", (await RunAsync("to-csv", output, "-")).Stdout);
+
+        (exitCode, _, stderr) = await RunAsync("to-xlsx", "--delimiter", ",", WriteFile("two.csv", "\nid,name\n1,a\n"), PathFor("two.xlsx"));
+        Assert.Equal(Cli.Failure, exitCode);
+        Assert.Contains("line 2: found 2 fields, expected 1 like the header", stderr);
+    }
+
+    [Fact]
+    public async Task ToXlsx_CannotDetectTheDelimiterFromABlankFirstLine()
+    {
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", WriteFile("in.csv", "\nid,name\n1,a\n"), PathFor("out.xlsx"));
+
+        Assert.Equal(Cli.Failure, exitCode);
+        Assert.Contains("line 1 is blank, so the delimiter cannot be detected", stderr);
+    }
+
+    [Theory]
+    [InlineData(null, "navn;by;bel\u00F8b\n\u00C6blegr\u00F8d;\u00C5rhus;\"1234,5\"\n")]
+    [InlineData(null, "navn\tby\tbel\u00F8b\n\u00C6blegr\u00F8d\t\u00C5rhus\t1234,5\n")]
+    [InlineData(null, "navn|by|bel\u00F8b\n\u00C6blegr\u00F8d|\u00C5rhus|1234,5\n")]
+    [InlineData(null, "navn,by,bel\u00F8b\n\u00C6blegr\u00F8d,\u00C5rhus,\"1234,5\"\n")]
+    [InlineData(";", "navn;by;bel\u00F8b\n\u00C6blegr\u00F8d;\u00C5rhus;\"1234,5\"\n")]
+    [InlineData("tab", "navn\tby\tbel\u00F8b\n\u00C6blegr\u00F8d\t\u00C5rhus\t1234,5\n")]
+    public async Task ToXlsx_DetectsTheDelimiter_OrUsesTheGivenOne(string? delimiter, string csv)
+    {
+        var output = PathFor("out.xlsx");
+        string[] options = delimiter is null ? [] : ["--delimiter", delimiter];
+
+        var (exitCode, _, stderr) = await RunAsync(["to-xlsx", .. options, WriteFile("in.csv", csv), output], stdin: "");
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("navn,by,bel\u00F8b\n\u00C6blegr\u00F8d,\u00C5rhus,\"1234,5\"\n", (await RunAsync("to-csv", output, "-")).Stdout);
+    }
+
+    [Theory]
+    [InlineData("\"id;ref\"\nx\n", "id;ref\nx\n")]
+    [InlineData("\"say \"\"hi\"\"; bye\"\nx\n", "\"say \"\"hi\"\"; bye\"\nx\n")]
+    public async Task ToXlsx_KeepsAQuotedOneColumnHeaderWithASeparatorInIt(string csv, string expected)
+    {
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", WriteFile("in.csv", csv), output);
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal(expected, (await RunAsync("to-csv", output, "-")).Stdout);
+    }
+
+    [Fact]
+    public async Task ToXlsx_DetectionIsNotQuoteAware_SoOneColumnWithSemicolonsNeedsTheDelimiter()
+    {
+        var input = WriteFile("in.csv", "note\na;b\n");
+
+        var (exitCode, _, _) = await RunAsync("to-xlsx", input, PathFor("detected.xlsx"));
+        Assert.Equal(Cli.Failure, exitCode);
+
+        (exitCode, _, var stderr) = await RunAsync("to-xlsx", "--delimiter", ",", input, PathFor("given.xlsx"));
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("note\na;b\n", (await RunAsync("to-csv", PathFor("given.xlsx"), "-")).Stdout);
+    }
+
+    [Fact]
+    public async Task ToXlsx_AnExplicitDelimiterIsUsedAsGiven()
+    {
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", "--delimiter", ";", WriteFile("in.csv", "a,b\n1,2\n"), output);
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("\"a,b\"\n\"1,2\"\n", (await RunAsync("to-csv", output, "-")).Stdout);
+    }
+
+    [Fact]
+    public async Task ToXlsx_AnExplicitCommaKeepsAOneColumnHeaderWithASemicolon()
+    {
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", "--delimiter", ",", WriteFile("in.csv", "Name; Title\nx\n"), output);
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("Name; Title\nx\n", (await RunAsync("to-csv", output, "-")).Stdout);
+    }
+
+    [Fact]
+    public async Task ToXlsx_KeepsLeadingAndTrailingSpaces_AndWrapsTextWithLineBreaks()
+    {
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", WriteFile("in.csv", "a,b\n\"  padded  \",\"two\nlines\"\n"), output);
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("a,b\n  padded  ,\"two\nlines\"\n", (await RunAsync("to-csv", output, "-")).Stdout);
+        Assert.Contains("xml:space=\"preserve\"", ReadWorksheetXml(output, 1));
+        Assert.Equal([false, false], CellsWrap(output, row: 1));
+        Assert.Equal([false, true], CellsWrap(output, row: 2));
+    }
+
+    [Fact]
+    public async Task ToXlsx_WrapsHeaderCellsAndLoneCarriageReturns()
+    {
+        var output = PathFor("out.xlsx");
+
+        var (exitCode, _, stderr) = await RunAsync("to-xlsx", WriteFile("in.csv", "\"multi\nheader\",b\n\"c\rd\",x\n"), output);
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal([true, false], CellsWrap(output, row: 1));
+        Assert.Equal([true, false], CellsWrap(output, row: 2));
+    }
+
+    [Fact]
+    public async Task ToXlsx_IgnoresSurroundingSpacesWhenParsingTypedValues()
+    {
+        var input = WriteFile("in.csv", "n,b,d,dt,t\n\" 12 \",\" true \",\" 2024-01-31 \",\" 2024-01-31 13:45:00 \",\" 12 \"\n\" x \",,,,\n");
+        var schema = WriteFile("schema.json", """{"n": "number", "b": "bool", "d": "date", "dt": "datetime"}""");
+        var output = PathFor("out.xlsx");
+        await RunAsync("to-xlsx", "--schema-file", schema, input, output);
+
+        using var reader = ExcelDataReader.Create(output, new ExcelDataReaderOptions { Schema = ExcelSchema.Dynamic });
+        Assert.True(reader.Read());
+        Assert.Equal(12d, reader.GetDouble(0));
+        Assert.Equal((ExcelDataType.Boolean, true), (reader.GetExcelDataType(1), reader.GetBoolean(1)));
+        Assert.Equal(new DateTime(2024, 1, 31), reader.GetDateTime(2));
+        Assert.Equal(new DateTime(2024, 1, 31, 13, 45, 0), reader.GetDateTime(3));
+        Assert.Equal((ExcelDataType.String, " 12 "), (reader.GetExcelDataType(4), reader.GetString(4)));
+        Assert.True(reader.Read());
+        Assert.Equal((ExcelDataType.String, " x "), (reader.GetExcelDataType(0), reader.GetString(0)));
+    }
+
+    [Theory]
+    [InlineData("yyyy-mm-dd", 10)]
+    [InlineData("dddd d. mmmm yyyy", 28)]
+    [InlineData("d. mmm yyyy", 12)]
+    public void ToXlsx_EstimatesHowWideADateFormatShows(string format, int expected)
+    {
+        Assert.Equal(expected, CsvToXlsx.DisplayLength(format));
     }
 
     [Fact]
@@ -316,6 +587,90 @@ public sealed class ConverterTests : IDisposable
     }
 
     [Fact]
+    public async Task ToCsv_ReadsXlsWorkbooks()
+    {
+        var workbook = Path.Combine(AppContext.BaseDirectory, "Fixtures", "sample.xls");
+
+        var (exitCode, stdout, stderr) = await RunAsync("to-csv", workbook, "-");
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("""
+            id,name,founded,modified
+            1,"Æble, ""Ø"" & Co",2024-01-31,2024-01-31 00:00:00
+            2.5,plain,1999-12-24,2024-01-31 13:45:00
+
+            """.ReplaceLineEndings("\n"), stdout);
+    }
+
+    [Fact]
+    public async Task ToCsv_KeepsTheTimeOfADateTimeAtMidnight()
+    {
+        var input = WriteFile("in.csv", "t\n2024-01-31 00:00:00\n2024-01-31 00:00:01\n");
+        var schema = WriteFile("schema.json", """{"t": "datetime"}""");
+        var workbook = PathFor("data.xlsx");
+        await RunAsync("to-xlsx", "--schema-file", schema, input, workbook);
+
+        var (_, stdout, _) = await RunAsync("to-csv", workbook, "-");
+
+        Assert.Equal("t\n2024-01-31 00:00:00\n2024-01-31 00:00:01\n", stdout);
+    }
+
+    [Fact]
+    public async Task ToCsv_WritesDateFormattedNumbersThatAreNotDatesAsNumbersOrTimes()
+    {
+        var input = WriteFile("in.csv", "d,dt\n2958466,0.5\n-1,0\n60,1.5\n");
+        var schema = WriteFile("schema.json", """{"d": {"type": "number", "format": "yyyy-mm-dd"}, "dt": {"type": "number", "format": "yyyy-mm-dd hh:mm:ss"}}""");
+        var workbook = PathFor("data.xlsx");
+        await RunAsync("to-xlsx", "--schema-file", schema, input, workbook);
+
+        var (exitCode, stdout, stderr) = await RunAsync("to-csv", workbook, "-");
+
+        Assert.True(exitCode == Cli.Success, stderr);
+        Assert.Equal("d,dt\n2958466,12:00:00\n-1,00:00:00\n60,1900-01-01 12:00:00\n", stdout);
+    }
+
+    [Fact]
+    public async Task ToCsv_WritesNegativeTimesAsNumbers()
+    {
+        var input = WriteFile("in.csv", "t\n-0.5\n0.75\n");
+        var schema = WriteFile("schema.json", """{"t": {"type": "number", "format": "hh:mm"}}""");
+        var workbook = PathFor("data.xlsx");
+        await RunAsync("to-xlsx", "--schema-file", schema, input, workbook);
+
+        var (_, stdout, _) = await RunAsync("to-csv", workbook, "-");
+
+        Assert.Equal("t\n-0.5\n18:00:00\n", stdout);
+    }
+
+    [Theory]
+    [InlineData("yyyy-mm-dd hh:mm:ss", true)]
+    [InlineData("m/d/yy h:mm AM/PM", true)]
+    [InlineData("yyyy-mm-dd", false)]
+    [InlineData("dd\\h mmm", false)]
+    [InlineData("[$-409]mmmm d", false)]
+    [InlineData("yyyy \"hours\"", false)]
+    public void ToCsv_RecognisesFormatsThatShowATime(string format, bool expected)
+    {
+        Assert.Equal(expected, XlsxToCsv.FormatShowsTime(format));
+    }
+
+    [Fact]
+    public async Task ToCsv_RejectsAZipThatIsNotAWorkbook()
+    {
+        var input = PathFor("archive.xlsx");
+        using (var archive = ZipFile.Open(input, ZipArchiveMode.Create))
+        {
+            using var writer = new StreamWriter(archive.CreateEntry("readme.txt").Open());
+            writer.Write("not a workbook");
+        }
+
+        var (exitCode, _, stderr) = await RunAsync("to-csv", input, "-");
+
+        Assert.Equal(Cli.Failure, exitCode);
+        Assert.Contains("input is a zip archive but not an xlsx or xlsb workbook", stderr);
+    }
+
+    [Fact]
     public async Task ToCsv_RejectsInputThatIsNotAWorkbook()
     {
         var (exitCode, _, stderr) = await RunAsync("to-csv", WriteFile("in.xlsx", "id\n1\n"), "-");
@@ -382,8 +737,19 @@ public sealed class ConverterTests : IDisposable
         Assert.Equal(expected, XlsxToCsv.FormatTime(value));
     }
 
+    [Fact]
+    public async Task NamesAnUnknownCommand()
+    {
+        var (exitCode, _, stderr) = await RunAsync("to-pdf", "--strict");
+
+        Assert.Equal(Cli.InvalidUsage, exitCode);
+        Assert.StartsWith("spreadsheet-converter: unknown command 'to-pdf'", stderr);
+    }
+
     [Theory]
     [InlineData]
+    [InlineData("to-csv", "--strict", "in.xlsx", "out.csv")]
+    [InlineData("to-xlsx", "--delimiter", ":", "in.csv", "out.xlsx")]
     [InlineData("to-pdf", "in", "out")]
     [InlineData("to-xlsx", "only-one-path")]
     [InlineData("to-xlsx", "--sheet-rows", "1", "in.csv", "out.xlsx")]
@@ -423,6 +789,21 @@ public sealed class ConverterTests : IDisposable
         var path = PathFor(name);
         File.WriteAllText(path, content.ReplaceLineEndings("\n"), new UTF8Encoding(false));
         return path;
+    }
+
+    /// <summary>Whether each cell in a row of the first sheet has a style with wrap text.</summary>
+    private static bool[] CellsWrap(string workbook, int row)
+    {
+        using var archive = ZipFile.OpenRead(workbook);
+        XNamespace ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+        var styles = XDocument.Load(archive.GetEntry("xl/styles.xml")!.Open())
+            .Descendants(ns + "cellXfs").Single().Elements(ns + "xf")
+            .Select(xf => (string?)xf.Element(ns + "alignment")?.Attribute("wrapText") == "1")
+            .ToArray();
+        return XDocument.Load(archive.GetEntry("xl/worksheets/sheet1.xml")!.Open())
+            .Descendants(ns + "row").ElementAt(row - 1).Elements(ns + "c")
+            .Select(c => (int?)c.Attribute("s") is { } style && styles[style])
+            .ToArray();
     }
 
     private static string ReadWorksheetXml(string workbook, int sheet)

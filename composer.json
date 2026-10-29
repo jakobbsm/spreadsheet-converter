@@ -20,12 +20,6 @@
             "Jakobbsm\\SpreadsheetConverter\\Tests\\": "tests/"
         }
     },
-    "bin": [
-        "bin/spreadsheet-converter-linux-arm64",
-        "bin/spreadsheet-converter-linux-x64",
-        "bin/spreadsheet-converter-osx-arm64",
-        "bin/spreadsheet-converter-win-x64.exe"
-    ],
     "scripts": {
         "test": "phpunit"
     },

@@ -12,7 +12,8 @@ internal enum ColumnType
 }
 
 /// <param name="Format">Excel number format code for the column's cells, or null for the type's default.</param>
-internal sealed record Column(ColumnType Type, string? Format = null);
+/// <param name="Width">Column width in characters, or null for the type's default.</param>
+internal sealed record Column(ColumnType Type, string? Format = null, double? Width = null);
 
 /// <summary>
 /// Column types for <c>to-xlsx</c>, read from a JSON object such as
@@ -23,6 +24,9 @@ internal static class Schema
 {
     /// <summary>Excel stores at most 255 characters per number format code.</summary>
     private const int MaxFormatChars = 255;
+
+    /// <summary>Excel's widest column, in characters.</summary>
+    private const double MaxWidth = 255;
 
     public static Dictionary<string, Column> Load(string? path)
     {
@@ -45,7 +49,7 @@ internal static class Schema
                 JsonValueKind.String => new Column(ParseType(column.Name, column.Value.GetString())),
                 JsonValueKind.Object => ParseColumn(column.Name, column.Value),
                 _ => throw new InvalidDataException(
-                    $"schema: column '{column.Name}' must be a type name or an object with \"type\" and \"format\""),
+                    $"schema: column '{column.Name}' must be a type name or an object with \"type\", \"format\" and \"width\""),
             };
         }
         return columns;
@@ -55,6 +59,7 @@ internal static class Schema
     {
         string? type = null;
         string? format = null;
+        double? width = null;
         foreach (var property in value.EnumerateObject())
         {
             switch (property.Name)
@@ -65,11 +70,20 @@ internal static class Schema
                 case "format" when property.Value.ValueKind == JsonValueKind.String:
                     format = property.Value.GetString();
                     break;
+                case "width" when property.Value.ValueKind == JsonValueKind.Number:
+                    width = property.Value.GetDouble();
+                    if (width is <= 0 or > MaxWidth)
+                    {
+                        throw new InvalidDataException($"schema: column '{name}': width must be above 0 and at most {MaxWidth}");
+                    }
+                    break;
                 case "type" or "format":
                     throw new InvalidDataException($"schema: column '{name}': \"{property.Name}\" must be a string");
+                case "width":
+                    throw new InvalidDataException($"schema: column '{name}': \"width\" must be a number");
                 default:
                     throw new InvalidDataException(
-                        $"schema: column '{name}' has unknown key '{property.Name}' (expected type and format)");
+                        $"schema: column '{name}' has unknown key '{property.Name}' (expected type, format and width)");
             }
         }
 
@@ -77,7 +91,7 @@ internal static class Schema
         {
             ValidateFormat(name, format);
         }
-        return new Column(type is null ? ColumnType.Text : ParseType(name, type), format);
+        return new Column(type is null ? ColumnType.Text : ParseType(name, type), format, width);
     }
 
     private static ColumnType ParseType(string name, string? type) => type switch

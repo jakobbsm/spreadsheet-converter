@@ -81,7 +81,7 @@ final class SpreadsheetConverterTest extends TestCase
         SpreadsheetConverter::binaryPath($this->directory.'/missing');
     }
 
-    public function test_it_restores_a_lost_executable_bit(): void
+    public function test_it_leaves_a_configured_binary_without_the_executable_bit_alone(): void
     {
         if (PHP_OS_FAMILY === 'Windows') {
             $this->markTestSkipped('Windows has no executable bit.');
@@ -90,8 +90,15 @@ final class SpreadsheetConverterTest extends TestCase
         $binary = $this->executable('converter');
         chmod($binary, 0644);
 
-        $this->assertSame($binary, SpreadsheetConverter::binaryPath($binary));
-        $this->assertTrue(is_executable($binary));
+        try {
+            SpreadsheetConverter::binaryPath($binary);
+            $this->fail('Expected the non-executable binary to be rejected.');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('is not executable', $exception->getMessage());
+        }
+
+        clearstatcache(true, $binary);
+        $this->assertSame(0644, fileperms($binary) & 0777);
     }
 
     public function test_it_builds_command_lines_without_a_shell(): void
@@ -103,7 +110,64 @@ final class SpreadsheetConverterTest extends TestCase
             SpreadsheetConverter::toXlsxCommand('-', 'out.xlsx', 'schema.json', 'Companies', 500000, $binary),
         );
         $this->assertSame([$binary, 'to-xlsx', 'in.csv', 'out.xlsx'], SpreadsheetConverter::toXlsxCommand('in.csv', 'out.xlsx', binary: $binary));
+        $this->assertSame([$binary, 'to-xlsx', '--strict', '-', 'out.xlsx'], SpreadsheetConverter::toXlsxCommand('-', 'out.xlsx', binary: $binary, strict: true));
+        $this->assertSame([$binary, 'to-xlsx', '--delimiter', ';', 'in.csv', 'out.xlsx'], SpreadsheetConverter::toXlsxCommand('in.csv', 'out.xlsx', binary: $binary, delimiter: ';'));
+        $this->assertSame([$binary, 'to-xlsx', '--delimiter', 'tab', 'in.csv', 'out.xlsx'], SpreadsheetConverter::toXlsxCommand('in.csv', 'out.xlsx', binary: $binary, delimiter: "\t"));
         $this->assertSame([$binary, 'to-csv', '--sheet', 'Data', 'in.xlsx', '-'], SpreadsheetConverter::toCsvCommand('in.xlsx', '-', 'Data', $binary));
+    }
+
+    public function test_csv_lines_encode_rows_the_way_the_converter_reads_them(): void
+    {
+        $stringable = new class implements \Stringable
+        {
+            public function __toString(): string
+            {
+                return 'stringable';
+            }
+        };
+
+        $lines = SpreadsheetConverter::csvLines((function () use ($stringable) {
+            yield ['id', 'name', 'active', 'note'];
+            yield [7, 'Æble, "Ø" & Co', true, null];
+            yield [0.5, "two\nlines", false, $stringable];
+            yield ['back\\slash"', '', 0, '007'];
+            yield [1234567.891234567, 0.1 + 0.2, 1.0, 1.5e-7];
+        })());
+
+        $this->assertSame([
+            "id,name,active,note\n",
+            "7,\"Æble, \"\"Ø\"\" & Co\",1,\n",
+            "0.5,\"two\nlines\",0,stringable\n",
+            "\"back\\slash\"\"\",,0,007\n",
+            "1234567.891234567,0.30000000000000004,1.0,1.5E-7\n",
+        ], iterator_to_array($lines, false));
+    }
+
+    public function test_csv_lines_quote_a_one_column_header(): void
+    {
+        $this->assertSame(
+            ["\"id;ref|x\"\"y\"\n", "a;b\n"],
+            iterator_to_array(SpreadsheetConverter::csvLines([['id;ref|x"y'], ['a;b']]), false),
+        );
+        $this->assertSame(["\"\"\n", "1\n"], iterator_to_array(SpreadsheetConverter::csvLines([[null], [1]]), false));
+    }
+
+    public function test_the_bundled_binary_accepts_a_one_column_export_with_a_semicolon_in_its_header(): void
+    {
+        $bundled = SpreadsheetConverter::bundledBinaryPath(SpreadsheetConverter::platform());
+        if (! is_file($bundled)) {
+            $this->markTestSkipped('No bundled binary for this platform; release builds add them.');
+        }
+
+        $xlsx = $this->directory.'/out.xlsx';
+        [$exitCode] = $this->runConverter(
+            SpreadsheetConverter::toXlsxCommand('-', $xlsx, strict: true, delimiter: ','),
+            SpreadsheetConverter::csvLines([['id;ref'], ['a;b'], ['c']]),
+        );
+        $this->assertSame(0, $exitCode);
+
+        [, $stdout] = $this->runConverter(SpreadsheetConverter::toCsvCommand($xlsx, '-'));
+        $this->assertSame("id;ref\na;b\nc\n", $stdout);
     }
 
     public function test_the_bundled_binary_round_trips_through_xlsx(): void
@@ -113,32 +177,35 @@ final class SpreadsheetConverterTest extends TestCase
             $this->markTestSkipped('No bundled binary for this platform; release builds add them.');
         }
 
-        $csv = $this->directory.'/in.csv';
-        $handle = fopen($csv, 'wb');
-        foreach ([['cvr', 'name', 'employees'], ['12345678', 'Æble, "Ø" & Co', '12']] as $row) {
-            fputcsv($handle, $row, ',', '"', '');
-        }
-        fclose($handle);
         $schema = $this->directory.'/schema.json';
-        file_put_contents($schema, '{"employees":"number"}');
+        file_put_contents($schema, '{"employees":"number","active":"bool"}');
         $xlsx = $this->directory.'/out.xlsx';
+        $rows = [['cvr', 'name', 'employees', 'active'], ['12345678', 'Æble, "Ø" & Co', 12, true]];
 
-        [$exitCode, $stdout] = $this->runConverter(SpreadsheetConverter::toXlsxCommand($csv, $xlsx, $schema));
+        [$exitCode, $stdout] = $this->runConverter(
+            SpreadsheetConverter::toXlsxCommand('-', $xlsx, $schema, strict: true, delimiter: ','),
+            SpreadsheetConverter::csvLines($rows),
+        );
         $this->assertSame(0, $exitCode);
         $this->assertSame(['rows' => 1, 'sheets' => 1, 'clipped_cells' => 0], json_decode($stdout, true));
 
         [$exitCode, $stdout] = $this->runConverter(SpreadsheetConverter::toCsvCommand($xlsx, '-'));
         $this->assertSame(0, $exitCode);
-        $this->assertSame("cvr,name,employees\n12345678,\"Æble, \"\"Ø\"\" & Co\",12\n", $stdout);
+        $this->assertSame("cvr,name,employees,active\n12345678,\"Æble, \"\"Ø\"\" & Co\",12,1\n", $stdout);
     }
 
     /**
      * @param  list<string>  $command
+     * @param  iterable<string>  $stdin
      * @return array{int, string}
      */
-    private function runConverter(array $command): array
+    private function runConverter(array $command, iterable $stdin = []): array
     {
-        $process = proc_open($command, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        foreach ($stdin as $chunk) {
+            fwrite($pipes[0], $chunk);
+        }
+        fclose($pipes[0]);
         $stdout = stream_get_contents($pipes[1]);
         $stderr = stream_get_contents($pipes[2]);
         fclose($pipes[1]);

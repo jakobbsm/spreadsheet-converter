@@ -14,7 +14,7 @@ internal static class Cli
 
     public const string Usage = """
         usage:
-          spreadsheet-converter to-xlsx [--schema-file <schema.json>] [--sheet-name <name>] [--sheet-rows <n>] <input.csv|-> <output.xlsx>
+          spreadsheet-converter to-xlsx [--schema-file <schema.json>] [--sheet-name <name>] [--sheet-rows <n>] [--delimiter <,|;|tab>] [--strict] <input.csv|-> <output.xlsx>
           spreadsheet-converter to-csv [--sheet <name>] <input.xlsx|.xlsb|.xls> <output.csv|->
           spreadsheet-converter --version
         """;
@@ -30,6 +30,12 @@ internal static class Cli
         if (args.Length == 0)
         {
             await stderr.WriteLineAsync(Usage);
+            return InvalidUsage;
+        }
+
+        if (args[0] is not ("to-xlsx" or "to-csv"))
+        {
+            await stderr.WriteLineAsync($"spreadsheet-converter: unknown command '{args[0]}'\n{Usage}");
             return InvalidUsage;
         }
 
@@ -81,7 +87,10 @@ internal static class Cli
         return InvalidUsage;
     }
 
-    /// <summary>Splits arguments into "--name value" options and exactly two positional paths.</summary>
+    /// <summary>Options that take no value; they are stored with an empty value.</summary>
+    private static readonly HashSet<string> Flags = ["--strict"];
+
+    /// <summary>Splits arguments into "--name value" options, flags and exactly two positional paths.</summary>
     private static bool TryParse(string[] args, out Dictionary<string, string> options, out string[] paths, out string error)
     {
         options = [];
@@ -90,7 +99,11 @@ internal static class Cli
 
         for (var i = 0; i < args.Length; i++)
         {
-            if (args[i].StartsWith("--", StringComparison.Ordinal))
+            if (Flags.Contains(args[i]))
+            {
+                options[args[i]] = "";
+            }
+            else if (args[i].StartsWith("--", StringComparison.Ordinal))
             {
                 if (i + 1 >= args.Length)
                 {
@@ -137,6 +150,23 @@ internal static class Cli
                         return false;
                     }
                     result = result with { SheetRows = sheetRows };
+                    break;
+                case "--strict":
+                    result = result with { Strict = true };
+                    break;
+                case "--delimiter":
+                    char? delimiter = value switch
+                    {
+                        "," or ";" or "|" => value[0],
+                        "tab" or "\t" => '\t',
+                        _ => null,
+                    };
+                    if (delimiter is null)
+                    {
+                        error = "--delimiter must be ',', ';', '|' or tab";
+                        return false;
+                    }
+                    result = result with { Delimiter = delimiter };
                     break;
                 default:
                     error = $"unknown option {name} for to-xlsx";
