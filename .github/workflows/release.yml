@@ -73,7 +73,7 @@ jobs:
           vendor/bin/phpunit
           vendor/bin/phpunit --filter test_the_bundled_binary_round_trips_through_xlsx --fail-on-skipped
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: spreadsheet-converter-${{ matrix.rid }}
           path: bin/spreadsheet-converter-${{ matrix.rid }}${{ matrix.extension }}
@@ -85,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           path: bin
           merge-multiple: true
