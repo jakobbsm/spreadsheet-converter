@@ -98,7 +98,9 @@ final class SpreadsheetConverter
      *
      * Write the CSV with fputcsv($handle, $row, ',', '"', '') and pass "-" as $input to stream it through stdin.
      * The schema file is a JSON object mapping column names to text, number, bool, date (Y-m-d) or
-     * datetime (Y-m-d H:i:s); unlisted columns, and values that do not parse as their type, are written as text.
+     * datetime (Y-m-d H:i:s), or to an object that adds an Excel number format code, such as
+     * {"type": "number", "format": "#,##0.00"}. Unlisted columns, and values that do not parse as their type, are
+     * written as text. Column names may repeat, except for names the schema lists; blank lines are skipped.
      *
      * @return list<string>
      */
@@ -124,8 +126,10 @@ final class SpreadsheetConverter
     /**
      * Command converting one worksheet of an xlsx, xlsb or xls file to CSV readable with fgetcsv($handle, null, ',', '"', '').
      *
-     * Pass "-" as $output to stream the CSV through stdout. Values are culture independent: numbers use a dot,
-     * booleans are 1/0, dates Y-m-d, date-times Y-m-d H:i:s and times H:i:s.
+     * The workbook type is detected from the contents, so upload paths without an extension work. The first non-blank
+     * row is the header. Pass "-" as $output to stream the CSV through stdout. Values are culture independent: numbers
+     * use a dot, booleans are 1/0, dates Y-m-d, date-times Y-m-d H:i:s, times H:i:s and durations (elapsed-time
+     * formats such as [h]:mm:ss) in total hours, such as 30:00:00.
      *
      * @return list<string>
      */
