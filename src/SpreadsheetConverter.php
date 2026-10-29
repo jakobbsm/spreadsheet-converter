@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Datapeeps\SpreadsheetConverter;
+namespace Jakobbsm\SpreadsheetConverter;
 
 use RuntimeException;
 
@@ -33,7 +33,7 @@ final class SpreadsheetConverter
 
         if (! is_file($path)) {
             throw new RuntimeException($configured === null
-                ? "The bundled spreadsheet converter is missing at {$path}. Install a tagged release of datapeeps/spreadsheet-converter, or set ".self::PATH_ENV.'.'
+                ? "The bundled spreadsheet converter is missing at {$path}. Install a tagged release of jakobbsm/spreadsheet-converter, or set ".self::PATH_ENV.'.'
                 : "The spreadsheet converter configured at {$path} does not exist.");
         }
 

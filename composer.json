@@ -1,5 +1,5 @@
 {
-    "name": "datapeeps/spreadsheet-converter",
+    "name": "jakobbsm/spreadsheet-converter",
     "description": "Fast streaming CSV/XLSX conversion for PHP, backed by a bundled native executable (no .NET runtime required).",
     "type": "library",
     "license": "MIT",
@@ -12,12 +12,12 @@
     },
     "autoload": {
         "psr-4": {
-            "Datapeeps\\SpreadsheetConverter\\": "src/"
+            "Jakobbsm\\SpreadsheetConverter\\": "src/"
         }
     },
     "autoload-dev": {
         "psr-4": {
-            "Datapeeps\\SpreadsheetConverter\\Tests\\": "tests/"
+            "Jakobbsm\\SpreadsheetConverter\\Tests\\": "tests/"
         }
     },
     "bin": [

@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Datapeeps\SpreadsheetConverter\Tests;
+namespace Jakobbsm\SpreadsheetConverter\Tests;
 
-use Datapeeps\SpreadsheetConverter\SpreadsheetConverter;
+use Jakobbsm\SpreadsheetConverter\SpreadsheetConverter;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;

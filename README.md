@@ -10,13 +10,13 @@ from CSV to XLSX in about 7 seconds with about 20 MB of memory.
 ## Installation
 
 ```sh
-composer require datapeeps/spreadsheet-converter
+composer require jakobbsm/spreadsheet-converter
 ```
 
 ## Usage from PHP
 
 ```php
-use Datapeeps\SpreadsheetConverter\SpreadsheetConverter;
+use Jakobbsm\SpreadsheetConverter\SpreadsheetConverter;
 use Illuminate\Support\Facades\Process;
 
 // Export: stream CSV rows into the converter's stdin.
