@@ -1,0 +1,107 @@
+# Builds the converter natively on each platform, then commits the binaries on a detached commit that only the
+# release tag points to. Composer installs tags, so every release ships all binaries while main stays binary-free.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the v prefix (e.g. 1.2.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.rid }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { rid: osx-arm64, os: macos-15, extension: '' }
+          - { rid: win-x64, os: windows-2025, extension: '.exe' }
+          # Ubuntu 22.04 links against glibc 2.35, so the binaries also run on hosts with older distributions.
+          - { rid: linux-x64, os: ubuntu-22.04, extension: '' }
+          - { rid: linux-arm64, os: ubuntu-22.04-arm, extension: '' }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate version
+        run: '[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "Invalid version: $VERSION"; exit 1; }'
+
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install NativeAOT prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Test
+        run: dotnet test dotnet/SpreadsheetConverter.slnx -c Release
+
+      - name: Publish
+        run: dotnet publish dotnet/src/SpreadsheetConverter -c Release -r ${{ matrix.rid }} -p:Version="$VERSION" -o publish
+
+      - name: Smoke test
+        run: |
+          binary="bin/spreadsheet-converter-${{ matrix.rid }}${{ matrix.extension }}"
+          mkdir -p bin
+          cp "publish/spreadsheet-converter${{ matrix.extension }}" "$binary"
+          test "$("$binary" --version)" = "$VERSION"
+          printf 'id,amount\n1,2.5\n' | "$binary" to-xlsx - smoke.xlsx
+          test "$("$binary" to-csv smoke.xlsx -)" = "$(printf 'id,amount\n1,2.5')"
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          coverage: none
+
+      # The round-trip test skips itself when the binary is missing, so it runs again with --fail-on-skipped to make
+      # sure it really exercised the binary built above.
+      - name: PHP tests against the binary
+        run: |
+          composer install --no-interaction --no-progress
+          vendor/bin/phpunit
+          vendor/bin/phpunit --filter test_the_bundled_binary_round_trips_through_xlsx --fail-on-skipped
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spreadsheet-converter-${{ matrix.rid }}
+          path: bin/spreadsheet-converter-${{ matrix.rid }}${{ matrix.extension }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: bin
+          merge-multiple: true
+
+      - name: Tag a commit containing the binaries
+        run: |
+          chmod +x bin/spreadsheet-converter-*
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --detach
+          git add --force bin/
+          git commit -m "Release v$VERSION"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v$VERSION" bin/spreadsheet-converter-* --title "v$VERSION" --generate-notes

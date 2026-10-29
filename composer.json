@@ -1,0 +1,35 @@
+{
+    "name": "datapeeps/spreadsheet-converter",
+    "description": "Fast streaming CSV/XLSX conversion for PHP, backed by a bundled native executable (no .NET runtime required).",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["xlsx", "csv", "excel", "spreadsheet", "export", "import"],
+    "require": {
+        "php": "^8.2"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Datapeeps\\SpreadsheetConverter\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Datapeeps\\SpreadsheetConverter\\Tests\\": "tests/"
+        }
+    },
+    "bin": [
+        "bin/spreadsheet-converter-linux-arm64",
+        "bin/spreadsheet-converter-linux-x64",
+        "bin/spreadsheet-converter-osx-arm64",
+        "bin/spreadsheet-converter-win-x64.exe"
+    ],
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

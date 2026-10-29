@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>spreadsheet-converter</AssemblyName>
+    <RootNamespace>SpreadsheetConverter</RootNamespace>
+    <Version>0.0.0-dev</Version>
+
+    <!-- One self-contained native executable per platform, no .NET runtime needed on the host. -->
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+    <OptimizationPreference>Speed</OptimizationPreference>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Sep" Version="0.17.1" />
+    <PackageReference Include="SpreadCheetah" Version="1.28.0" />
+    <PackageReference Include="Sylvan.Data.Excel" Version="0.5.8" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SpreadsheetConverter.Tests" />
+  </ItemGroup>
+
+</Project>

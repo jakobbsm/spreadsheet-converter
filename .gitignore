@@ -1,0 +1,12 @@
+/vendor/
+/composer.lock
+/.phpunit.cache/
+/artifacts/
+
+# Release builds add the binaries on the tagged commit only.
+/bin/
+
+dotnet/**/bin/
+dotnet/**/obj/
+.DS_Store
+.idea/
